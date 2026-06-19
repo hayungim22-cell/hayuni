@@ -86,7 +86,7 @@ x      = np.arange(PERIODS + 1)              # 0 ~ PERIODS 개월
 
 # 충격반응 행렬 및 표준오차
 irfs = irf.orth_irfs if ORTH else irf.irfs   # shape: (T+1, n, n)
-sems = irf.orth_stderr() if ORTH else irf.stderr()  # shape: (T+1, n, n)
+sems = irf.stderr(orth=ORTH)                 # shape: (T+1, n, n)
 
 def get_ci(row_var, col_var, z=1.96):
     """response of row_var to impulse in col_var"""
