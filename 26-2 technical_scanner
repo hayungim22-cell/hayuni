@@ -1,0 +1,184 @@
+"""
+기술적 지표 기반 과매도 반등 종목 스캐너
+
+지표
+- RSI(14, Wilder 방식): 30 이하 과매도, 70 이상 과매수
+- 볼린저밴드(20, 2σ) 내 위치(%): 0이면 하단선, 100이면 상단선
+- 스토캐스틱 %K(14), %D(3)
+- MACD(12, 26, 9) 골든크로스 여부
+- 거래량 배율: 당일 거래량 / 20일 평균 거래량
+- 5일선 상승 전환, 최근 5일 저점 대비 2% 이상 반등, 120일선 위 여부
+
+실행 (저장소 루트에서):
+    python 06_technical_scanner/technical_scanner.py
+    python 06_technical_scanner/technical_scanner.py --tickers-csv data/tickers.csv --mode relaxed
+"""
+
+import argparse
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+ROOT = Path(__file__).resolve().parent.parent
+OUT_DIR = ROOT / "outputs"
+
+DEFAULT_TICKERS = {
+    "삼성전자": "005930.KS",
+    "SK하이닉스": "000660.KS",
+    "현대차": "005380.KS",
+    "LG화학": "051910.KS",
+    "삼성SDI": "006400.KS",
+    "POSCO홀딩스": "005490.KS",
+    "NAVER": "035420.KS",
+    "카카오": "035720.KS",
+    "에코프로비엠": "247540.KQ",
+    "HLB": "028300.KQ",
+}
+
+# 원래 대화의 엄격 조건 / 완화 조건
+FILTERS = {
+    "strict":  dict(rsi=45, bb=35, stoch=30, vol=1.5, need_ma_rebound=True, need_bounce=True),
+    "relaxed": dict(rsi=50, bb=40, stoch=35, vol=1.3, need_ma_rebound=True, need_bounce=False),
+}
+
+
+# ---------------------------------------------------------------- 지표
+def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def bollinger(close: pd.Series, period: int = 20, k: float = 2.0):
+    ma = close.rolling(period).mean()
+    sd = close.rolling(period).std()
+    return ma, ma + k * sd, ma - k * sd
+
+
+def stochastic(df: pd.DataFrame, k: int = 14, d: int = 3):
+    low_min = df["Low"].rolling(k).min()
+    high_max = df["High"].rolling(k).max()
+    k_line = (df["Close"] - low_min) / (high_max - low_min) * 100
+    return k_line, k_line.rolling(d).mean()
+
+
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    line = close.ewm(span=fast, adjust=False).mean() - close.ewm(span=slow, adjust=False).mean()
+    sig = line.ewm(span=signal, adjust=False).mean()
+    return line, sig
+
+
+# ---------------------------------------------------------------- 데이터
+def load_tickers(path: str | None) -> dict:
+    if path is None:
+        return DEFAULT_TICKERS
+    df = pd.read_csv(path, encoding="utf-8-sig", dtype=str)
+    return dict(zip(df["종목명"], df["티커"]))
+
+
+def extract(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """yfinance 버전별 열 구조 차이를 흡수해 한 종목의 OHLCV만 꺼냄."""
+    if isinstance(raw.columns, pd.MultiIndex):
+        if ticker in raw.columns.get_level_values(0):
+            return raw[ticker].dropna(how="all")
+        if ticker in raw.columns.get_level_values(1):
+            return raw.xs(ticker, axis=1, level=1).dropna(how="all")
+        return pd.DataFrame()
+    return raw.dropna(how="all")
+
+
+def analyze(name: str, ticker: str, df: pd.DataFrame) -> dict | None:
+    if len(df) < 60:
+        return None
+    close = df["Close"]
+    price = close.iloc[-1]
+
+    rsi = rsi_wilder(close).iloc[-1]
+    _, upper, lower = bollinger(close)
+    width = upper.iloc[-1] - lower.iloc[-1]
+    bb_pos = (price - lower.iloc[-1]) / width * 100 if width > 0 else np.nan
+    k_line, d_line = stochastic(df)
+    m_line, m_sig = macd(close)
+    vol_ratio = df["Volume"].iloc[-1] / df["Volume"].rolling(20).mean().iloc[-1]
+    ma5 = close.rolling(5).mean()
+    ma120 = close.rolling(120).mean().iloc[-1]
+
+    return {
+        "종목": name,
+        "티커": ticker,
+        "현재가": int(price),
+        "RSI": round(rsi, 1),
+        "BB위치(%)": round(bb_pos, 1),
+        "Stoch_K": round(k_line.iloc[-1], 1),
+        "Stoch_D": round(d_line.iloc[-1], 1),
+        "MACD>Signal": bool(m_line.iloc[-1] > m_sig.iloc[-1]),
+        "거래량배율": round(vol_ratio, 2),
+        "MA5반등": bool(ma5.iloc[-1] > ma5.iloc[-2]),
+        "저점대비2%반등": bool(price >= close.iloc[-5:].min() * 1.02),
+        "120일선위": (bool(price > ma120) if not np.isnan(ma120) else None),
+    }
+
+
+def apply_filter(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    f = FILTERS[mode]
+    cond = (
+        (df["RSI"] < f["rsi"])
+        & (df["BB위치(%)"] < f["bb"])
+        & (df["Stoch_K"] < f["stoch"])
+        & (df["거래량배율"] >= f["vol"])
+    )
+    if f["need_ma_rebound"]:
+        cond &= df["MA5반등"]
+    if f["need_bounce"]:
+        cond &= df["저점대비2%반등"]
+    return df[cond].sort_values("RSI")
+
+
+# ---------------------------------------------------------------- 실행
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tickers-csv", default=None, help="종목명,티커 두 열짜리 CSV")
+    parser.add_argument("--mode", choices=FILTERS.keys(), default="strict")
+    parser.add_argument("--period", default="1y")
+    args = parser.parse_args()
+
+    OUT_DIR.mkdir(exist_ok=True)
+    tickers = load_tickers(args.tickers_csv)
+    print(f"{len(tickers)}개 종목 다운로드 중...")
+
+    raw = yf.download(list(tickers.values()), period=args.period, group_by="ticker",
+                      auto_adjust=True, progress=False, threads=True)
+
+    rows = []
+    for name, ticker in tickers.items():
+        try:
+            row = analyze(name, ticker, extract(raw, ticker))
+            if row:
+                rows.append(row)
+        except Exception as e:  # 개별 종목 오류는 건너뜀
+            print(f"{name}({ticker}) 건너뜀: {e}")
+
+    full = pd.DataFrame(rows).sort_values("RSI")
+    print(f"\n분석 완료: {len(full)}개 종목\n")
+    print(full.to_string(index=False))
+
+    cand = apply_filter(full, args.mode)
+    print(f"\n--- 매수 후보 ({args.mode}, {len(cand)}개) ---")
+    if cand.empty:
+        print("조건 충족 종목 없음")
+    else:
+        print(cand.to_string(index=False))
+
+    stamp = datetime.now().strftime("%Y%m%d")
+    full.to_csv(OUT_DIR / f"06_scan_all_{stamp}.csv", index=False, encoding="utf-8-sig")
+    cand.to_csv(OUT_DIR / f"06_scan_candidates_{stamp}.csv", index=False, encoding="utf-8-sig")
+    print(f"\n저장: outputs/06_scan_all_{stamp}.csv, outputs/06_scan_candidates_{stamp}.csv")
+
+
+if __name__ == "__main__":
+    main()
