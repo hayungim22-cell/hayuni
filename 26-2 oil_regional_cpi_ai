@@ -1,0 +1,240 @@
+"""
+1. 데이터 수집: 두바이유 + 지역 CPI (한국은행 ECOS Open API)
+
+실행 (저장소 루트에서):
+    python 10_oil_regional_cpi_ai/collect.py --years 10
+    python 10_oil_regional_cpi_ai/collect.py --demo      # API 키 없이 가상 데이터로 동작 확인
+"""
+
+import argparse
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from pyutils.ecos_api import fetch_series  # noqa: E402
+
+load_dotenv(ROOT / ".env")
+OUT_DIR = ROOT / "outputs"
+
+# ---------------- CONFIG (미검증 코드: --list-items로 확인 후 수정) ----------------
+OIL_SERIES = ("731Y003", "M", "0000001")   # 원래 대화: 국제원유가격 > Dubai
+CPI_SERIES = ("901Y009", "M", "0")         # 원래 대화: 전남 CPI로 표기됐으나 전국 총지수 코드와 동일
+# -------------------------------------------------------------------------------
+
+
+def make_demo(n_months: int = 120) -> pd.DataFrame:
+    """가상 데이터. CPI가 유가에 2개월 시차로 반응하도록 생성."""
+    rng = np.random.default_rng(42)
+    dates = pd.date_range(end=pd.Timestamp.today().normalize().replace(day=1),
+                          periods=n_months, freq="MS")
+    oil = np.clip(55 + np.cumsum(rng.normal(0, 3, n_months)), 20, 130)
+    cpi = 95 + np.cumsum(0.05 + rng.normal(0, 0.15, n_months))
+    cpi[2:] += (oil[:-2] - 55) * 0.03
+    return pd.DataFrame({"date": dates, "oil": oil.round(2), "cpi": cpi.round(2)})
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--years", type=int, default=10)
+    parser.add_argument("--demo", action="store_true", help="가상 데이터 사용")
+    args = parser.parse_args()
+
+    OUT_DIR.mkdir(exist_ok=True)
+
+    if args.demo:
+        df = make_demo(args.years * 12)
+        out = OUT_DIR / "10_raw_data_demo.csv"
+        print("가상 데이터 생성 (실제 통계 아님)")
+    else:
+        now = datetime.now()
+        start, end = f"{now.year - args.years}01", now.strftime("%Y%m")
+        oil = fetch_series(*OIL_SERIES, start, end, "oil")
+        cpi = fetch_series(*CPI_SERIES, start, end, "cpi")
+        df = oil.merge(cpi, on="date", how="inner")
+        out = OUT_DIR / "10_raw_data.csv"
+        print(f"수집 완료: {df['date'].min():%Y-%m} ~ {df['date'].max():%Y-%m}")
+
+    df.to_csv(out, index=False, encoding="utf-8-sig")
+    print(f"저장: {out} ({len(df)}행)")
+
+
+if __name__ == "__main__":
+    main()
+
+    """
+2. 시차 상관분석 + Claude·Gemini 3라운드 토론
+
+라운드
+  1) Claude: 최적 시차의 경제적 의미, 여수·광양 석유화학단지 연관성, 리스크 관리 제안
+  2) Gemini: Claude 분석에 대한 반론·보완
+  3) Claude: 반론을 반영한 최종 결론과 권고 3가지
+
+실행 (저장소 루트에서):
+    python 10_oil_regional_cpi_ai/analyze_ai_discussion.py
+    python 10_oil_regional_cpi_ai/analyze_ai_discussion.py --demo --skip-ai
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+from scipy import stats
+
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / ".env")
+OUT_DIR = ROOT / "outputs"
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+SYSTEM_PROMPT = (
+    "당신은 에너지·물가 분석가입니다. 한국 전남 지역의 유가-CPI 시차 상관분석 결과를 검토합니다. "
+    "수치에 근거한 사실과 해석(의견)을 구분하고, 상관관계를 인과관계로 단정하지 마십시오. "
+    "한국어로 간결하게 답하십시오."
+)
+
+
+# ---------------------------------------------------------------- 분석
+def transform(df: pd.DataFrame, how: str) -> pd.DataFrame:
+    x = df.set_index("date")[["oil", "cpi"]]
+    if how == "yoy":
+        return x.pct_change(12) * 100
+    if how == "mom":
+        return np.log(x).diff() * 100
+    return x  # levels
+
+
+def cross_correlation(t: pd.DataFrame, max_lag: int) -> pd.DataFrame:
+    """corr(oil_t, cpi_{t+lag}). lag > 0이면 유가가 lag개월 선행."""
+    rows = []
+    for lag in range(max_lag + 1):
+        pair = pd.concat([t["oil"], t["cpi"].shift(-lag)], axis=1).dropna()
+        r, p = stats.pearsonr(pair.iloc[:, 0], pair.iloc[:, 1])
+        rows.append({"lag_months": lag, "correlation": round(r, 4),
+                     "p_value": round(p, 6), "n": len(pair)})
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------- API
+def call_claude(prompt: str) -> str:
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": CLAUDE_MODEL,
+            "max_tokens": 1500,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    return resp.json()["content"][0]["text"]
+
+
+def call_gemini(prompt: str) -> str:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    resp = requests.post(
+        url,
+        headers={"content-type": "application/json", "x-goog-api-key": GEMINI_API_KEY},
+        json={
+            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{"parts": [{"text": prompt}]}],
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def ai_discussion(corr: pd.DataFrame, raw: pd.DataFrame, how: str) -> list[dict]:
+    best = corr.loc[corr["correlation"].abs().idxmax()]
+    summary = (
+        f"기간: {raw['date'].min():%Y-%m} ~ {raw['date'].max():%Y-%m}, "
+        f"변환: {how}, 최적 시차: {int(best['lag_months'])}개월 "
+        f"(r={best['correlation']:.3f}, p={best['p_value']:.4f})\n"
+        f"시차별 결과: {corr.to_dict(orient='records')}"
+    )
+    log = []
+
+    p1 = (f"다음은 Dubai 유가 → 전남 CPI 시차 상관분석 결과입니다.\n{summary}\n\n"
+          "① 최적 시차와 그 경제적 의미 ② 여수·광양 석유화학단지와의 연관성 "
+          "③ 리스크 관리 제안을 분석하십시오.")
+    print("[Claude] 1라운드 분석 중...")
+    c1 = call_claude(p1)
+    log.append({"speaker": "Claude", "round": 1, "text": c1})
+
+    p2 = (f"[분석 결과]\n{summary}\n\n[Claude 분석]\n{c1}\n\n"
+          "위 분석의 약점(표본, 자기상관, 인과 해석 등)을 지적하고 보완 의견을 제시하십시오.")
+    print("[Gemini] 2라운드 반론 중...")
+    g1 = call_gemini(p2)
+    log.append({"speaker": "Gemini", "round": 2, "text": g1})
+
+    p3 = (f"[원래 분석]\n{c1}\n\n[Gemini 반론]\n{g1}\n\n"
+          "반론을 반영해 최종 결론과 실무 권고 3가지를 정리하십시오.")
+    print("[Claude] 3라운드 종합 중...")
+    c2 = call_claude(p3)
+    log.append({"speaker": "Claude", "round": 3, "text": c2})
+    return log
+
+
+# ---------------------------------------------------------------- 실행
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--demo", action="store_true", help="10_raw_data_demo.csv 사용")
+    parser.add_argument("--transform", choices=["yoy", "mom", "levels"], default="yoy")
+    parser.add_argument("--max-lag", type=int, default=12)
+    parser.add_argument("--skip-ai", action="store_true", help="AI 토론 생략")
+    args = parser.parse_args()
+
+    raw_path = OUT_DIR / ("10_raw_data_demo.csv" if args.demo else "10_raw_data.csv")
+    raw = pd.read_csv(raw_path, parse_dates=["date"])
+    print(f"데이터: {raw_path.name} ({len(raw)}행)")
+
+    corr = cross_correlation(transform(raw, args.transform).dropna(), args.max_lag)
+    corr.to_csv(OUT_DIR / "10_correlation_results.csv", index=False, encoding="utf-8-sig")
+    best = corr.loc[corr["correlation"].abs().idxmax()]
+    print(corr.to_string(index=False))
+    print(f"\n최적 시차: {int(best['lag_months'])}개월 (r={best['correlation']:.4f})")
+
+    meta = {"source": raw_path.name, "transform": args.transform}
+    (OUT_DIR / "10_meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+    if args.skip_ai:
+        return
+    if not (ANTHROPIC_API_KEY and GEMINI_API_KEY):
+        print("\nANTHROPIC_API_KEY 또는 GEMINI_API_KEY 없음: AI 토론 생략")
+        return
+
+    try:
+        log = ai_discussion(corr, raw, args.transform)
+    except requests.RequestException as e:
+        print(f"\nAI 토론 실패: {e}")
+        return
+
+    out = OUT_DIR / "10_ai_discussion.json"
+    out.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
+    for turn in log:
+        print(f"\n===== {turn['speaker']} (Round {turn['round']}) =====\n{turn['text']}")
+    print(f"\n저장: {out}")
+
+
+if __name__ == "__main__":
+    main()
