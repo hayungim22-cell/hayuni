@@ -1,0 +1,128 @@
+"""
+한국은행 ECOS Open API 수집 + 유가 전이계수 시변 추정 (Rolling OLS)
+
+모형: ΔlnCPI_t = a + b_oil·ΔlnOIL_t + b_fx·ΔlnFX_t + e_t
+      12개월 창을 한 달씩 이동하며 b_oil을 반복 추정 → 시변 전이계수
+
+사전 준비:
+    .env에 BOK_API_KEY 입력
+    항목코드 확인: python 09_ecos_api_rolling_ols/ecos_rolling_ols.py --list-items 901Y009
+
+실행 (저장소 루트에서):
+    python 09_ecos_api_rolling_ols/ecos_rolling_ols.py --start 202001 --end 202603
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import matplotlib
+import matplotlib.font_manager as fm
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from pyutils.ecos_api import fetch_series, list_items  # noqa: E402
+
+load_dotenv(ROOT / ".env")
+OUT_DIR = ROOT / "outputs"
+
+# 이름: (통계표코드, 주기, 항목코드 경로)
+# 아래 값은 원래 대화에서 쓰던 코드이며 검증되지 않음.
+# 특히 OIL(901Y002 / 1111101)은 원래 대화에서 조회에 실패한 기록이 있음.
+# --list-items로 실제 항목코드를 확인한 뒤 수정할 것.
+SERIES = {
+    "CPI": ("901Y009", "M", "0"),
+    "FX":  ("731Y001", "M", "0000001/0000100"),
+    "OIL": ("901Y002", "M", "1111101"),
+}
+
+
+def set_korean_font() -> None:
+    fonts = [f for f in fm.findSystemFonts()
+             if any(k in f.lower() for k in ("nanum", "malgun", "applegothic"))]
+    if fonts:
+        fm.fontManager.addfont(fonts[0])
+        matplotlib.rcParams["font.family"] = fm.FontProperties(fname=fonts[0]).get_name()
+    matplotlib.rcParams["axes.unicode_minus"] = False
+
+
+def collect(start: str, end: str) -> pd.DataFrame:
+    frames = []
+    for name, (stat, cycle, item) in SERIES.items():
+        s = fetch_series(stat, cycle, item, start, end, name)
+        print(f"{name}: {len(s)}건 ({s['date'].min():%Y-%m} ~ {s['date'].max():%Y-%m})")
+        frames.append(s.set_index("date"))
+    return pd.concat(frames, axis=1, join="inner").sort_index()
+
+
+def rolling_beta(ret: pd.DataFrame, window: int) -> pd.DataFrame:
+    rows = []
+    for i in range(window, len(ret) + 1):
+        sub = ret.iloc[i - window:i]
+        X = sm.add_constant(sub[["OIL", "FX"]])
+        fit = sm.OLS(sub["CPI"], X).fit()
+        lo, hi = fit.conf_int().loc["OIL"]
+        rows.append({
+            "date": sub.index[-1],
+            "beta_oil": fit.params["OIL"],
+            "lower": lo,
+            "upper": hi,
+            "p_oil": fit.pvalues["OIL"],
+            "beta_fx": fit.params["FX"],
+        })
+    return pd.DataFrame(rows).set_index("date")
+
+
+def plot_beta(beta: pd.DataFrame, window: int, out_path: Path) -> None:
+    set_korean_font()
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.fill_between(beta.index, beta["lower"], beta["upper"], alpha=0.2, label="95% CI")
+    ax.plot(beta.index, beta["beta_oil"], lw=2, label="Oil pass-through beta")
+    ax.axhline(0, color="red", ls="--", alpha=0.6)
+    ax.set_title(f"Time-varying oil pass-through to CPI (rolling OLS, {window}m window)")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", default="202001")
+    parser.add_argument("--end", default="202603")
+    parser.add_argument("--window", type=int, default=12)
+    parser.add_argument("--list-items", metavar="STAT_CODE",
+                        help="통계표 항목코드 목록만 출력하고 종료")
+    args = parser.parse_args()
+
+    if args.list_items:
+        print(list_items(args.list_items).to_string(index=False))
+        return
+
+    OUT_DIR.mkdir(exist_ok=True)
+    df = collect(args.start, args.end)
+    df.to_csv(OUT_DIR / "09_ecos_raw.csv", encoding="utf-8-sig")
+
+    ret = np.log(df).diff().dropna() * 100
+    if len(ret) < args.window + 2:
+        raise SystemExit(f"관측치 {len(ret)}개: 창 크기 {args.window}보다 충분히 길어야 함")
+
+    beta = rolling_beta(ret, args.window)
+    beta.to_csv(OUT_DIR / "09_rolling_beta.csv", encoding="utf-8-sig")
+    plot_beta(beta, args.window, OUT_DIR / "09_rolling_beta.png")
+
+    sig_share = (beta["p_oil"] < 0.05).mean() * 100
+    print(f"\n최근 유가 전이계수: {beta['beta_oil'].iloc[-1]:.4f} "
+          f"(95% CI {beta['lower'].iloc[-1]:.4f} ~ {beta['upper'].iloc[-1]:.4f})")
+    print(f"전체 창 중 5% 유의한 비율: {sig_share:.1f}%")
+    print("저장: outputs/09_ecos_raw.csv, 09_rolling_beta.csv, 09_rolling_beta.png")
+
+
+if __name__ == "__main__":
+    main()
