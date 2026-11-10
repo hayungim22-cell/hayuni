@@ -1,0 +1,128 @@
+# =============================================================
+# 유가-PPI 롤링 상관관계 + Chow 구조변화 검정
+#     - 6개월 롤링 상관: 수준 / 로그차분 두 가지
+#     - Chow 검정: 사건 시점 전후 d_ppi ~ d_oil + d_er 관계 변화
+#     - Bai-Perron: 구조변화 시점을 데이터에서 추정
+# 실행: 저장소 루트를 작업 디렉터리로 두고 source()
+# =============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(zoo)
+  library(strucchange)
+})
+source("R/ecos_utils.R")
+
+# ---------------- CONFIG ----------------
+DATA_DIR <- "data"
+OUT_DIR  <- "outputs"
+
+FILE_OIL_DAILY <- file.path(DATA_DIR, "국제_원유가격.csv")
+FILE_ER        <- file.path(DATA_DIR, "원화의_대미달러_환율.csv")
+FILE_PPI       <- file.path(DATA_DIR, "생산자물가지수_품목별.csv")
+KEY_PPI        <- "총지수"
+
+ROLL_WINDOW <- 6
+
+# 사건 시점: 해당 월부터 새 구간이 시작된다고 가정
+EVENTS <- c(
+  "2020-03-01" = "코로나19",
+  "2022-02-01" = "러시아-우크라이나 전쟁",
+  "2022-06-01" = "유가 고점",
+  "2023-10-01" = "이스라엘-하마스",
+  "2025-10-01" = "중동 리스크 고조"
+)
+# ----------------------------------------
+
+dir.create(OUT_DIR, showWarnings = FALSE)
+
+# 1. 데이터
+oil <- oil_monthly(read_oil_daily(FILE_OIL_DAILY))
+er  <- read_er(FILE_ER)
+ppi <- read_ecos_wide(FILE_PPI, key_col = 2, key_value = KEY_PPI, out_name = "ppi")
+
+df <- purrr::reduce(list(oil, er, ppi), ~ inner_join(.x, .y, by = "date")) |>
+  arrange(date) |>
+  mutate(d_oil = c(NA, diff(log(oil)) * 100),
+         d_er  = c(NA, diff(log(er))  * 100),
+         d_ppi = c(NA, diff(log(ppi)) * 100)) |>
+  drop_na()
+
+cat("표본:", format(min(df$date)), "~", format(max(df$date)),
+    "/ n =", nrow(df), "\n\n")
+
+# 2. 롤링 상관관계
+roll_cor <- function(x, y, w) {
+  rollapplyr(cbind(x, y), width = w,
+             FUN = function(m) cor(m[, 1], m[, 2]),
+             by.column = FALSE, fill = NA)
+}
+
+roll <- tibble(
+  date         = df$date,
+  `수준`       = roll_cor(df$oil,   df$ppi,   ROLL_WINDOW),
+  `로그차분`   = roll_cor(df$d_oil, df$d_ppi, ROLL_WINDOW)
+) |>
+  pivot_longer(-date, names_to = "기준", values_to = "corr") |>
+  drop_na()
+
+write_csv(roll, file.path(OUT_DIR, "08_rolling_corr.csv"))
+
+event_df <- tibble(date = as.Date(names(EVENTS)), label = unname(EVENTS))
+
+p_roll <- ggplot(roll, aes(date, corr, color = `기준`)) +
+  geom_line(linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(data = event_df, aes(xintercept = date),
+             linetype = "dotted", color = "gray40") +
+  labs(title = paste0("Dubai oil - PPI rolling correlation (", ROLL_WINDOW, " months)"),
+       x = NULL, y = "correlation") +
+  theme_minimal()
+ggsave(file.path(OUT_DIR, "08_rolling_corr.png"), p_roll, width = 10, height = 5, dpi = 150)
+
+# 3. Chow 검정 (사건 시점별)
+#    sctest의 point는 "첫 구간의 마지막 관측치" 위치이므로 사건 월 직전(idx - 1)을 넣음
+chow_one <- function(date_str, label) {
+  idx <- which(df$date == as.Date(date_str))
+  if (length(idx) == 0) {
+    return(tibble(사건 = label, 시점 = date_str, F = NA_real_, p_value = NA_real_,
+                  비고 = "해당 월 데이터 없음"))
+  }
+  res <- tryCatch(
+    sctest(d_ppi ~ d_oil + d_er, data = df, type = "Chow", point = idx - 1),
+    error = function(e) e
+  )
+  if (inherits(res, "error")) {
+    return(tibble(사건 = label, 시점 = date_str, F = NA_real_, p_value = NA_real_,
+                  비고 = conditionMessage(res)))
+  }
+  tibble(사건 = label, 시점 = date_str,
+         F = round(unname(res$statistic), 3),
+         p_value = round(res$p.value, 4),
+         비고 = ifelse(res$p.value < 0.05, "5% 유의: 구조변화", "비유의"))
+}
+
+chow_tbl <- purrr::map2_dfr(names(EVENTS), unname(EVENTS), chow_one)
+cat("=== Chow 구조변화 검정: d_ppi ~ d_oil + d_er ===\n")
+print(chow_tbl)
+write_csv(chow_tbl, file.path(OUT_DIR, "08_chow_results.csv"))
+
+# 4. Bai-Perron: 구조변화 시점 추정 (각 구간 최소 15% 관측치)
+bp <- breakpoints(d_ppi ~ d_oil + d_er, data = df, h = 0.15)
+bp_n <- length(na.omit(bp$breakpoints))
+
+sink(file.path(OUT_DIR, "08_bai_perron.txt"))
+cat("===== Bai-Perron 다중 구조변화 검정 =====\n\n")
+print(summary(bp))
+if (bp_n > 0) {
+  cat("\nBIC 기준 추정 구조변화 시점:\n")
+  print(df$date[bp$breakpoints])
+} else {
+  cat("\nBIC 기준 구조변화 없음\n")
+}
+sink()
+
+cat("\nBai-Perron 추정 구조변화 수:", bp_n, "\n")
+if (bp_n > 0) print(df$date[bp$breakpoints])
+
+cat("\n완료: outputs/08_rolling_corr.png, 08_chow_results.csv, 08_bai_perron.txt\n")
