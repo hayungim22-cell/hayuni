@@ -1,0 +1,208 @@
+"""
+볼린저밴드 + RSI 평균회귀 전략 백테스트 (backtrader)
+
+규칙
+- 매수: 종가 < 볼린저 하단(20, 2σ) 그리고 RSI(14) < 35
+- 매도: 종가 > 볼린저 중심선 (평균 회귀)
+- 손절: 매수가 대비 -7%
+- 비용: 매수·매도 수수료 0.015%, 매도 시 거래세 0.20%
+- 비중: 가용 현금의 95%를 정수 주식 수로 매수
+
+실행 (저장소 루트에서):
+    python 07_bollinger_rsi_backtest/bollinger_rsi_backtest.py
+    python 07_bollinger_rsi_backtest/bollinger_rsi_backtest.py \
+        --tickers-csv data/tickers.csv --start 2020-01-01 --end 2025-01-01 --segments 5
+"""
+
+import argparse
+import warnings
+from pathlib import Path
+
+import backtrader as bt
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+warnings.filterwarnings("ignore")
+
+ROOT = Path(__file__).resolve().parent.parent
+OUT_DIR = ROOT / "outputs"
+
+DEFAULT_TICKERS = {
+    "삼성전자": "005930.KS",
+    "SK하이닉스": "000660.KS",
+    "현대차": "005380.KS",
+    "카카오": "035720.KS",
+    "NAVER": "035420.KS",
+    "에코프로비엠": "247540.KQ",
+    "HLB": "028300.KQ",
+    "레인보우로보틱스": "277810.KQ",
+}
+
+
+# ---------------------------------------------------------------- 비용
+class KRStockCommission(bt.CommInfoBase):
+    """매수·매도 수수료 + 매도 시 거래세"""
+    params = (
+        ("fee", 0.00015),
+        ("tax", 0.0020),
+        ("stocklike", True),
+        ("commtype", bt.CommInfoBase.COMM_PERC),
+        ("percabs", True),
+    )
+
+    def _getcommission(self, size, price, pseudoexec):
+        value = abs(size) * price
+        rate = self.p.fee + (self.p.tax if size < 0 else 0.0)
+        return value * rate
+
+
+# ---------------------------------------------------------------- 전략
+class BollingerRSI(bt.Strategy):
+    params = dict(
+        bb_period=20,
+        devfactor=2.0,
+        rsi_period=14,
+        rsi_buy=35,
+        stop_loss=0.07,
+    )
+
+    def __init__(self):
+        self.bb = bt.indicators.BollingerBands(
+            self.data.close, period=self.p.bb_period, devfactor=self.p.devfactor)
+        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period, safediv=True)
+        self.order = None
+        self.buy_price = None
+
+    def next(self):
+        if self.order:
+            return
+        close = self.data.close[0]
+
+        if not self.position:
+            if close < self.bb.lines.bot[0] and self.rsi[0] < self.p.rsi_buy:
+                self.order = self.buy()
+                self.buy_price = close
+        else:
+            if close > self.bb.lines.mid[0]:
+                self.order = self.close()
+            elif close < self.buy_price * (1 - self.p.stop_loss):
+                self.order = self.close()
+
+    def notify_order(self, order):
+        if order.status in (order.Completed, order.Canceled, order.Margin, order.Rejected):
+            self.order = None
+
+
+# ---------------------------------------------------------------- 실행 단위
+def load_prices(ticker: str, start: str, end: str) -> pd.DataFrame:
+    df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.columns = [str(c).lower() for c in df.columns]
+    return df.dropna()
+
+
+def run_backtest(df: pd.DataFrame, cash: float) -> dict:
+    cerebro = bt.Cerebro(stdstats=False)
+    cerebro.addstrategy(BollingerRSI)
+    cerebro.adddata(bt.feeds.PandasData(dataname=df))
+    cerebro.broker.setcash(cash)
+    cerebro.broker.addcommissioninfo(KRStockCommission())
+    cerebro.addsizer(bt.sizers.PercentSizerInt, percents=95)
+    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trade")
+    cerebro.addanalyzer(bt.analyzers.DrawDown, _name="dd")
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe",
+                        timeframe=bt.TimeFrame.Days, annualize=True, riskfreerate=0.0)
+
+    strat = cerebro.run()[0]
+    trade = strat.analyzers.trade.get_analysis()
+    closed = trade.get("total", {}).get("closed", 0)
+    won = trade.get("won", {}).get("total", 0)
+    sharpe = strat.analyzers.sharpe.get_analysis().get("sharperatio")
+    final = cerebro.broker.getvalue()
+
+    return {
+        "전략수익률(%)": round((final / cash - 1) * 100, 2),
+        "보유수익률(%)": round((df["close"].iloc[-1] / df["close"].iloc[0] - 1) * 100, 2),
+        "거래수": closed,
+        "승률(%)": round(won / closed * 100, 1) if closed else np.nan,
+        "MDD(%)": round(strat.analyzers.dd.get_analysis().max.drawdown, 2),
+        "샤프": round(sharpe, 2) if sharpe is not None else np.nan,
+        "최종자본": int(final),
+    }
+
+
+def split_periods(start: str, end: str, n: int) -> list[tuple[str, str]]:
+    edges = pd.date_range(start, end, periods=n + 1)
+    return [(edges[i].strftime("%Y-%m-%d"), edges[i + 1].strftime("%Y-%m-%d")) for i in range(n)]
+
+
+def summarize(df: pd.DataFrame, title: str) -> None:
+    print(f"\n=== {title} ===")
+    print(f"종목 수          : {len(df)}")
+    print(f"평균 전략수익률  : {df['전략수익률(%)'].mean():.2f}%")
+    print(f"평균 보유수익률  : {df['보유수익률(%)'].mean():.2f}%")
+    print(f"평균 승률        : {df['승률(%)'].mean():.1f}%")
+    print(f"평균 MDD         : {df['MDD(%)'].mean():.2f}%")
+    print(f"수익 종목 비율   : {(df['전략수익률(%)'] > 0).mean() * 100:.1f}%")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tickers-csv", default=None, help="종목명,티커 두 열짜리 CSV")
+    parser.add_argument("--start", default="2020-01-01")
+    parser.add_argument("--end", default="2025-01-01")
+    parser.add_argument("--cash", type=float, default=5_000_000)
+    parser.add_argument("--min-trades", type=int, default=3)
+    parser.add_argument("--segments", type=int, default=1, help="구간 수 (1이면 전체 기간 한 번)")
+    args = parser.parse_args()
+
+    OUT_DIR.mkdir(exist_ok=True)
+    if args.tickers_csv:
+        t = pd.read_csv(args.tickers_csv, encoding="utf-8-sig", dtype=str)
+        tickers = dict(zip(t["종목명"], t["티커"]))
+    else:
+        tickers = DEFAULT_TICKERS
+
+    periods = split_periods(args.start, args.end, args.segments)
+    results = []
+
+    for i, (name, ticker) in enumerate(tickers.items(), start=1):
+        print(f"[{i}/{len(tickers)}] {name}")
+        try:
+            prices = load_prices(ticker, args.start, args.end)
+        except Exception as e:
+            print(f"  다운로드 실패: {e}")
+            continue
+
+        for seg_no, (s, e) in enumerate(periods, start=1):
+            seg = prices.loc[s:e]
+            if len(seg) < 120:
+                continue
+            res = run_backtest(seg, args.cash)
+            if res["거래수"] < args.min_trades:
+                continue
+            results.append({"종목": name, "티커": ticker, "구간": seg_no,
+                            "시작": s, "종료": e, **res})
+
+    if not results:
+        print("조건을 충족한 결과 없음")
+        return
+
+    df = pd.DataFrame(results)
+    summarize(df, "전체")
+    if args.segments > 1:
+        for seg_no, g in df.groupby("구간"):
+            summarize(g, f"구간 {seg_no} ({g['시작'].iloc[0]} ~ {g['종료'].iloc[0]})")
+
+    print("\n전략수익률 상위 10")
+    print(df.sort_values("전략수익률(%)", ascending=False).head(10).to_string(index=False))
+
+    out = OUT_DIR / "07_backtest_results.csv"
+    df.to_csv(out, index=False, encoding="utf-8-sig")
+    print(f"\n저장: {out}")
+
+
+if __name__ == "__main__":
+    main()
